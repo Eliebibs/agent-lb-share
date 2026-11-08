@@ -1,0 +1,286 @@
+# deployment-installation Specification
+
+## Purpose
+
+Define installation modes and smoke-test expectations so the Helm chart remains portable across supported deployments.
+## Requirements
+### Requirement: macOS service restart completion is readiness-driven and timed
+
+The macOS LaunchAgent installer MUST wait for the previous localhost listener to release, MUST retry bootstrap using bounded state-driven backoff, and MUST require `/health/ready` before reporting successful installation. Its readiness deadline MUST be bounded, operator-configurable, and long enough by default for an observed loaded-host cold start. It MUST report elapsed timing for the restart phases without exposing environment variable values or credentials.
+
+#### Scenario: Existing service restarts promptly
+
+- **WHEN** the existing LaunchAgent releases its listener and launchd accepts bootstrap before the retry deadline
+- **THEN** the installer proceeds without an unconditional fixed cooldown
+- **AND** it reports bootout, bootstrap, process startup, and readiness elapsed timing
+
+#### Scenario: Process is live but not ready
+
+- **WHEN** the replacement process responds to liveness but `/health/ready` remains unavailable
+- **THEN** the installer does not report success
+- **AND** it continues bounded readiness polling or exits with a diagnostic naming the service log
+
+#### Scenario: LaunchAgent disappears during readiness polling
+
+- **WHEN** launchd briefly reports the replacement job loaded and then removes it before the process becomes ready
+- **THEN** the installer performs bounded re-bootstrap attempts inside the readiness deadline
+- **AND** it does not spend the remaining deadline polling a nonexistent job
+
+### Requirement: Helm chart is organized around install modes
+
+The Helm chart MUST document and support three primary install modes: bundled PostgreSQL, direct external database, and external secrets. These install contracts MUST be portable across Kubernetes providers without requiring provider-specific chart forks.
+
+#### Scenario: Bundled mode values exist
+
+- **WHEN** a user wants a self-contained install
+- **THEN** the chart provides a bundled mode values overlay with bundled PostgreSQL enabled
+
+#### Scenario: External DB mode values exist
+
+- **WHEN** a user wants to install against an already reachable PostgreSQL database
+- **THEN** the chart provides an external DB values overlay and accepts direct DB URL or DB secret wiring
+
+#### Scenario: External secrets mode values exist
+
+- **WHEN** a user wants to source credentials from External Secrets Operator
+- **THEN** the chart provides an external secrets values overlay that keeps migration and startup behavior fail-closed
+
+### Requirement: Helm install modes are smoke-tested
+
+The project MUST run automated Helm smoke installs for the easy-setup install modes in CI.
+
+#### Scenario: Bundled and external DB modes are smoke tested
+
+- **WHEN** CI runs Helm smoke installation checks
+- **THEN** it installs the chart on a disposable Kubernetes cluster in bundled mode
+- **AND** it installs the chart on a disposable Kubernetes cluster in external DB mode
+- **AND** both installs reach a healthy testable state
+
+### Requirement: Helm support policy is pinned to modern Kubernetes minors
+
+The chart MUST declare a minimum supported Kubernetes version of `1.32`, and CI MUST validate chart rendering against a `1.35` baseline instead of older legacy minors.
+
+#### Scenario: Chart metadata declares the minimum supported version
+
+- **WHEN** a user inspects the chart metadata and README
+- **THEN** the documented minimum supported Kubernetes version is `1.32`
+
+#### Scenario: CI validates the modern baseline
+
+- **WHEN** CI runs Kubernetes schema validation and kind-based smoke installs
+- **THEN** the validation set includes Kubernetes `1.35`
+- **AND** pre-`1.32` validation targets are not treated as the support baseline
+
+### Requirement: Application data directory resolution is configurable and container-aware
+
+The application MUST resolve its default data directory from operator intent before container heuristics. A non-empty `AGENT_LB_DATA_DIR` value MUST be the highest-priority data directory override. When no override is configured, an existing `$HOME/.agent-lb` directory MUST remain preferred even if the process detects that it is running inside a container. The container data directory (`/var/lib/agent-lb`) MUST be used only when no override is configured, the home data directory does not already exist, and container detection is true.
+
+#### Scenario: Explicit data directory override wins
+
+- **GIVEN** `AGENT_LB_DATA_DIR` is configured to a non-empty path
+- **WHEN** application settings are loaded
+- **THEN** the configured path is used as the data directory
+- **AND** the container detection result does not override it
+
+#### Scenario: Existing home data is reused inside an interactive container
+
+- **GIVEN** `AGENT_LB_DATA_DIR` is not configured
+- **AND** `$HOME/.agent-lb` already exists
+- **AND** container detection is true
+- **WHEN** application settings are loaded
+- **THEN** `$HOME/.agent-lb` is used as the data directory
+- **AND** `/var/lib/agent-lb` is not selected
+
+#### Scenario: Container default is preserved when no home data exists
+
+- **GIVEN** `AGENT_LB_DATA_DIR` is not configured
+- **AND** `$HOME/.agent-lb` does not exist
+- **AND** container detection is true
+- **WHEN** application settings are loaded
+- **THEN** `/var/lib/agent-lb` is used as the data directory
+
+#### Scenario: Related default paths follow the resolved data directory
+
+- **GIVEN** the resolved data directory differs from the module-import default
+- **AND** the database URL, encryption key file, conversation archive directory, and response-create dump directory are not explicitly configured
+- **WHEN** application settings and proxy dump helpers are used
+- **THEN** the default SQLite database URL points at `<data-dir>/store.db`
+- **AND** the default encryption key file points at `<data-dir>/encryption.key`
+- **AND** the default conversation archive directory points at `<data-dir>/conversation-archive`
+- **AND** oversized response-create dumps are written under `<data-dir>/debug/response-create-dumps`
+
+#### Scenario: Explicit related path overrides are preserved
+
+- **GIVEN** `AGENT_LB_DATA_DIR` is configured
+- **AND** one or more related paths such as `AGENT_LB_DATABASE_URL`, `AGENT_LB_ENCRYPTION_KEY_FILE`, or `AGENT_LB_CONVERSATION_ARCHIVE_DIR` are explicitly configured
+- **WHEN** application settings are loaded
+- **THEN** each explicitly configured related path keeps its configured value
+- **AND** only omitted related paths derive from the resolved data directory
+
+### Requirement: macOS LaunchAgent install preserves runtime configuration
+
+The macOS LaunchAgent installer MUST preserve existing operator runtime configuration when regenerating the `com.aneyman.agent-lb` plist. Existing environment variables, command-line arguments after the agent-lb binary, and LaunchAgent resource limits MUST survive reinstall. Installer-owned defaults MAY fill missing values, including metrics defaults, but MUST NOT remove existing database, dashboard-auth, trusted-proxy, OAuth, or resource-limit settings. The port-conflict guard MUST evaluate the localhost service endpoint rather than unrelated Tailnet listeners on the same public port.
+The default local service runtime MUST include the Prometheus client required by installer-owned metrics defaults.
+
+#### Scenario: Existing Postgres and trusted proxy settings survive reinstall
+
+- **GIVEN** an existing `com.aneyman.agent-lb` LaunchAgent plist contains
+  `AGENT_LB_DATABASE_URL`, `AGENT_LB_DASHBOARD_AUTH_MODE`,
+  `AGENT_LB_PROXY_UNAUTHENTICATED_CLIENT_CIDRS`, custom `--host` and `--port`
+  arguments, and file descriptor resource limits
+- **WHEN** `scripts/install-service.sh` regenerates the plist
+- **THEN** the generated plist retains those existing values
+- **AND** it adds missing metrics defaults without replacing explicit metrics
+  overrides
+- **AND** the default runtime dependencies include the metrics scraper library
+
+#### Scenario: Tailnet listener does not block local restart
+
+- **GIVEN** Tailscale or another remote forwarder listens on port `2455` for a
+  Tailnet address
+- **AND** no unrelated process owns `127.0.0.1:2455`
+- **WHEN** the macOS installer evaluates whether it may bootstrap agent-lb
+- **THEN** the Tailnet listener alone does not trigger the local port-conflict
+  guard
+
+### Requirement: Watchdog revives an un-bootstrapped launchd service
+
+The repository MUST version the host watchdog script at `scripts/watchdog.sh` as
+the canonical source for `~/.agent-lb/bin/watchdog.sh`. When the main launchd
+job is not bootstrapped, the service plist exists, and no pause file is present,
+the watchdog MUST re-bootstrap the service after a configurable number of
+consecutive ticks (default 2). The pause file MUST be the only signal that
+downtime is intentional.
+
+#### Scenario: Failed deploy leaves the service booted out
+
+- **GIVEN** the launchd job is not bootstrapped and no pause file exists
+- **WHEN** the watchdog observes the missing job for 2 consecutive ticks
+- **THEN** it bootstraps the service from the plist
+
+#### Scenario: Single missing tick does not trigger revival
+
+- **GIVEN** the launchd job is not bootstrapped and no pause file exists
+- **WHEN** the watchdog observes the missing job for the first tick
+- **THEN** it records the observation without bootstrapping
+
+#### Scenario: Pause file marks downtime as intentional
+
+- **GIVEN** the pause file exists
+- **WHEN** the watchdog runs while the job is not bootstrapped
+- **THEN** it exits without bootstrapping or kickstarting
+
+### Requirement: Claude Code client wiring includes the CCDEX worker
+
+The project SHALL provide a deterministic installer for the canonical coding-agent policy and the `cc`, `ccdex`, and `ccdex-worker-mcp` client executables, and SHALL support user-scoped Claude Code MCP registration of `ccdex-worker-mcp`. Installation MUST converge the routing-owned portions of global Claude and Codex instructions, MUST set direct Claude Code to the canonical Fable model, and MUST install and register the versioned CCDEX GPT-only guard hook. Installation MUST preserve unrelated Markdown sections, JSON keys, permission rules, hooks, environment values, and machine-specific configuration. Re-running installation MUST converge without duplicating managed blocks, hooks, or registrations, and removal MUST be explicit rather than coupled to service uninstall.
+
+#### Scenario: First client install
+- **WHEN** an operator installs Claude Code client wiring
+- **THEN** the three client entry points resolve to the current checkout
+- **AND** the host-neutral coding-agent policy path resolves to the versioned repository policy
+- **AND** the global Claude and Codex instruction files contain one canonical routing adapter each
+- **AND** direct Claude Code defaults to the canonical Fable model
+- **AND** the user CCDEX guard hook resolves to the versioned repository hook and is registered once for relevant pre-tool calls
+- **AND** Claude Code lists a connected `ccdex-worker` stdio MCP server using the installed worker executable
+
+#### Scenario: Existing machine-specific configuration is reconciled
+
+- **GIVEN** global Claude and Codex files contain legacy routing prose and unrelated instructions
+- **AND** Claude settings contain unrelated keys, environment values, permissions, and hooks
+- **WHEN** the client installer runs
+- **THEN** known legacy routing prose is replaced by the canonical adapters
+- **AND** unrelated Markdown sections and JSON values remain present
+- **AND** unrelated hooks remain registered
+
+#### Scenario: Repeated client install
+- **WHEN** the client installer runs again for the same checkout
+- **THEN** the policy link, executable links, managed routing blocks, model field, guard hook, and MCP registration converge on the same targets
+- **AND** it does not create duplicate managed blocks, hook registrations, or server names
+
+#### Scenario: Preview install
+- **WHEN** the client installer runs in preview mode
+- **THEN** it reports the policy link, executable links, routing adapters, model field, guard hook, and MCP registration it would change
+- **AND** it does not mutate user configuration
+
+#### Scenario: Conflicting existing guard hook is preserved
+
+- **GIVEN** the CCDEX guard hook path contains a regular user file
+- **WHEN** installation first claims that path
+- **THEN** the installer preserves the file at a deterministic backup path before linking the versioned hook
+- **AND** it refuses to overwrite the path when that backup already exists
+
+### Requirement: Canonical frontend designer agent installation
+
+The coding-agent policy installer SHALL install the versioned frontend-designer definition with the canonical Opus model into the user's Claude agents directory and SHALL record explicit ownership when it claims that path. Installation MUST checkpoint a pre-existing definition before replacement, MUST preserve unrelated agent files, and MUST converge idempotently. Uninstall MUST remove the definition only when ownership was previously recorded and its installed content still matches the versioned managed content.
+
+#### Scenario: First frontend designer install
+
+- **WHEN** an operator installs the canonical coding-agent policy
+- **THEN** `~/.claude/agents/frontend-designer.md` matches the versioned definition
+- **AND** its model is Opus
+
+#### Scenario: Existing frontend designer definition
+
+- **GIVEN** a machine-local frontend-designer definition already exists
+- **WHEN** the installer converges the canonical policy
+- **THEN** the existing definition is copied into the installation checkpoint before replacement
+- **AND** unrelated Claude agent definitions remain unchanged
+
+#### Scenario: Repeated and preview installation
+
+- **WHEN** the installer runs repeatedly or in preview mode
+- **THEN** repeated installation is byte-stable
+- **AND** preview reports any designer-definition change without mutating it
+
+#### Scenario: Uninstall after local customization
+
+- **GIVEN** the installed managed frontend-designer definition was modified after installation
+- **WHEN** the operator uninstalls the managed coding-agent policy
+- **THEN** the customized definition remains present
+- **AND** the operator is told it was preserved
+
+#### Scenario: Uninstall never-managed identical definition
+
+- **GIVEN** a user-created frontend-designer definition is byte-identical to the versioned definition
+- **AND** the installer has never recorded ownership of it
+- **WHEN** the operator uninstalls the managed coding-agent policy
+- **THEN** the user-created definition remains present
+- **AND** the operator is told it was preserved as unmanaged
+
+### Requirement: macOS Codex routing guard preserves local Agent LB routing
+
+The project SHALL provide a macOS Codex routing guard and installer that keep a host-configurable Codex model provider routed to the local Agent LB endpoint. The guard MUST validate the complete TOML document before mutation, MUST preserve unrelated configuration and provider identity, and MUST repair only top-level `model_provider` plus `base_url`, `wire_api`, `supports_websockets`, and `requires_openai_auth` in the selected provider table. A repair MUST require a healthy loopback Agent LB, MUST use a mode-preserving atomic replacement, and MUST be idempotent. Malformed configuration MUST fail without clobbering the source.
+
+The installer MUST install a dedicated per-user LaunchAgent with `RunAtLoad`, `WatchPaths` for the resolved Codex config target, and a modest `StartInterval` fallback. Preview MUST be non-mutating, uninstall MUST remove only an owned LaunchAgent, and recurring failures MUST NOT produce desktop notifications or unbounded duplicate logs.
+
+#### Scenario: ChatGPT changes the active provider to direct OpenAI
+
+- **GIVEN** a valid Codex config selects `openai`
+- **AND** the configured host provider is `agent-lb` or `codex-lb`
+- **AND** local Agent LB health succeeds
+- **WHEN** the routing guard runs
+- **THEN** the active provider is restored to the configured host provider
+- **AND** its provider table targets `http://127.0.0.1:2455/backend-api/codex` with Responses websocket and OpenAI-auth support enabled
+- **AND** unrelated configuration remains unchanged
+
+#### Scenario: Provider table is missing
+
+- **GIVEN** a valid Codex config does not contain the configured host provider table
+- **AND** local Agent LB health succeeds
+- **WHEN** the routing guard runs
+- **THEN** exactly one canonical provider table is appended
+- **AND** repeated runs make no further byte changes
+
+#### Scenario: Config is malformed
+
+- **GIVEN** the Codex config is invalid TOML or contains duplicate managed tables
+- **WHEN** the routing guard runs
+- **THEN** it exits with a diagnostic
+- **AND** the original file bytes are unchanged
+
+#### Scenario: ChatGPT writes after login
+
+- **GIVEN** the dedicated LaunchAgent is installed
+- **WHEN** ChatGPT replaces the watched Codex config after an app update
+- **THEN** launchd invokes the guard from the watched-path event or interval fallback
+- **AND** routing eventually converges without an immutable-file restriction or desktop-notification loop

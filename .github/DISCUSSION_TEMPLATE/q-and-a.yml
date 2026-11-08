@@ -1,0 +1,46 @@
+title: "Q: <one-line question>"
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for usage and how-to questions. For bug reports and
+        feature proposals, please file an [Issue](https://github.com/aneym/agent-lb/issues/new/choose) instead.
+        For security vulnerabilities, use a [private advisory](https://github.com/aneym/agent-lb/security/advisories/new) - do not post them publicly.
+
+  - type: input
+    id: version
+    attributes:
+      label: agent-lb version
+      placeholder: "1.20.0-beta.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment method
+      options:
+        - uvx
+        - pip
+        - Docker
+        - Docker Compose
+        - Helm chart
+        - From source
+        - Not yet deployed — pre-install question
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: |
+        Describe what you're trying to do and what's blocking you. Include any
+        commands you've already tried and the output you got.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Config snippets (redact secrets), logs, screenshots.

@@ -1,0 +1,758 @@
+from __future__ import annotations
+
+import base64
+import json
+
+import pytest
+from sqlalchemy import select
+
+from app.core.auth import DEFAULT_EMAIL, generate_unique_account_id, parse_auth_json
+from app.core.crypto import TokenEncryptor
+from app.db.models import Account, AccountStatus
+from app.db.session import SessionLocal
+
+pytestmark = pytest.mark.integration
+
+
+def _encode_jwt(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    return f"header.{body}.sig"
+
+
+@pytest.mark.asyncio
+async def test_import_and_list_accounts(async_client):
+    email = "tester@example.com"
+    raw_account_id = "acc_explicit"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": "acc_payload",
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["accountId"] == expected_account_id
+    assert data["email"] == email
+    assert data["planType"] == "plus"
+
+    list_response = await async_client.get("/api/accounts")
+    assert list_response.status_code == 200
+    accounts = list_response.json()["accounts"]
+    assert any(account["accountId"] == expected_account_id for account in accounts)
+
+
+@pytest.mark.asyncio
+async def test_import_glm_api_key_account(async_client):
+    response = await async_client.post(
+        "/api/accounts/import/api-key",
+        json={
+            "provider": "glm",
+            "apiKey": "zai-test-key",
+            "email": "glm-user@example.com",
+            "accountId": "zai_glm_test",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    expected_account_id = generate_unique_account_id("zai_glm_test", "glm-user@example.com")
+    assert data["accountId"] == expected_account_id
+    assert data["email"] == "glm-user@example.com"
+    assert data["planType"] == "glm-coding"
+
+    accounts = (await async_client.get("/api/accounts")).json()["accounts"]
+    imported = next(account for account in accounts if account["accountId"] == expected_account_id)
+    assert imported["provider"] == "glm"
+    assert imported["alias"] == "GLM Coding Plan"
+
+    async with SessionLocal() as session:
+        account = (await session.execute(select(Account).where(Account.id == expected_account_id))).scalar_one()
+    encryptor = TokenEncryptor()
+    assert account.provider == "glm"
+    assert encryptor.decrypt(account.access_token_encrypted) == "zai-test-key"
+    assert encryptor.decrypt(account.refresh_token_encrypted) == "zai-test-key"
+    assert account.id_token_encrypted is None
+
+
+@pytest.mark.asyncio
+async def test_reactivate_missing_account_returns_404(async_client):
+    response = await async_client.post("/api/accounts/missing/reactivate")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_pause_missing_account_returns_404(async_client):
+    response = await async_client.post("/api/accounts/missing/pause")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_pause_account(async_client):
+    email = "pause@example.com"
+    raw_account_id = "acc_pause"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    pause = await async_client.post(f"/api/accounts/{expected_account_id}/pause")
+    assert pause.status_code == 200
+    assert pause.json()["status"] == "paused"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    data = accounts.json()["accounts"]
+    matched = next((account for account in data if account["accountId"] == expected_account_id), None)
+    assert matched is not None
+    assert matched["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_update_account_subscription_ledger_does_not_pause_account(async_client):
+    email = "subscription@example.com"
+    raw_account_id = "acc_subscription"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    ledger = {
+        "status": "paused",
+        "nextChargeAt": None,
+        "currentPeriodEndAt": "2026-06-22T04:00:00.000Z",
+        "amount": 200,
+        "currency": "usd",
+        "lastVerifiedAt": "2026-06-09T18:00:00.000Z",
+        "notes": "Paused in vendor billing UI.",
+    }
+    update = await async_client.put(f"/api/accounts/{expected_account_id}/subscription", json=ledger)
+    assert update.status_code == 200
+    assert update.json()["subscription"]["status"] == "paused"
+    assert update.json()["subscription"]["currency"] == "USD"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matched = next(
+        (account for account in accounts.json()["accounts"] if account["accountId"] == expected_account_id),
+        None,
+    )
+    assert matched is not None
+    assert matched["status"] == "active"
+    assert matched["subscription"]["status"] == "paused"
+    assert matched["subscription"]["currentPeriodEndAt"] == "2026-06-22T04:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_update_account_subscription_ledger_rejects_cancel_pending_status(async_client):
+    email = "subscription-reject-cancel-pending@example.com"
+    raw_account_id = "acc_subscription_reject_cancel_pending"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    update = await async_client.put(
+        f"/api/accounts/{expected_account_id}/subscription",
+        json={"status": "cancel_pending"},
+    )
+
+    assert update.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_accounts_maps_legacy_cancel_pending_subscription_status_to_active(async_client):
+    email = "subscription-legacy-cancel-pending@example.com"
+    raw_account_id = "acc_subscription_legacy_cancel_pending"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        account = await session.get(Account, expected_account_id)
+        assert account is not None
+        account.subscription_status = " cancel_pending "
+        await session.commit()
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matched = next(
+        (account for account in accounts.json()["accounts"] if account["accountId"] == expected_account_id),
+        None,
+    )
+    assert matched is not None
+    assert matched["subscription"]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_list_accounts_normalizes_existing_subscription_status(async_client):
+    email = "subscription-normalized@example.com"
+    raw_account_id = "acc_subscription_normalized"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        account = await session.get(Account, expected_account_id)
+        assert account is not None
+        account.subscription_status = " CANCELED "
+        await session.commit()
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matched = next(
+        (account for account in accounts.json()["accounts"] if account["accountId"] == expected_account_id),
+        None,
+    )
+    assert matched is not None
+    assert matched["subscription"]["status"] == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_pause_reauth_required_account_returns_conflict(async_client):
+    email = "pause-reauth@example.com"
+    raw_account_id = "acc_pause_reauth"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        account = await session.get(Account, expected_account_id)
+        assert account is not None
+        account.status = AccountStatus.REAUTH_REQUIRED
+        account.deactivation_reason = "Authentication token invalidated - re-login required"
+        await session.commit()
+
+    pause = await async_client.post(f"/api/accounts/{expected_account_id}/pause")
+    assert pause.status_code == 409
+    assert pause.json()["error"]["code"] == "account_state_transition_invalid"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matched = next(
+        (account for account in accounts.json()["accounts"] if account["accountId"] == expected_account_id),
+        None,
+    )
+    assert matched is not None
+    assert matched["status"] == "reauth_required"
+
+
+@pytest.mark.asyncio
+async def test_reactivate_reauth_required_account_returns_conflict(async_client):
+    email = "reactivate-reauth@example.com"
+    raw_account_id = "acc_reactivate_reauth"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        account = await session.get(Account, expected_account_id)
+        assert account is not None
+        account.status = AccountStatus.REAUTH_REQUIRED
+        account.deactivation_reason = "Authentication token invalidated - re-login required"
+        await session.commit()
+
+    reactivate = await async_client.post(f"/api/accounts/{expected_account_id}/reactivate")
+    assert reactivate.status_code == 409
+    assert reactivate.json()["error"]["code"] == "account_state_transition_invalid"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    matched = next(
+        (account for account in accounts.json()["accounts"] if account["accountId"] == expected_account_id),
+        None,
+    )
+    assert matched is not None
+    assert matched["status"] == "reauth_required"
+
+
+@pytest.mark.asyncio
+async def test_update_account_limit_warmup_opt_in(async_client):
+    email = "warmup@example.com"
+    raw_account_id = "acc_warmup"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    update = await async_client.put(f"/api/accounts/{expected_account_id}/limit-warmup", json={"enabled": True})
+    assert update.status_code == 200
+    assert update.json() == {"status": "enabled", "enabled": True}
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    data = accounts.json()["accounts"]
+    matched = next((account for account in data if account["accountId"] == expected_account_id), None)
+    assert matched is not None
+    assert matched["limitWarmupEnabled"] is True
+    assert matched["limitWarmup"] is None
+
+
+@pytest.mark.asyncio
+async def test_export_account_returns_latest_codex_auth_json_with_no_store_headers(async_client):
+    email = "export@example.com"
+    raw_account_id = "acc_export"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    export = await async_client.post(f"/api/accounts/{expected_account_id}/export")
+    assert export.status_code == 200
+    assert export.headers["cache-control"] == "no-store, no-cache, must-revalidate, private"
+    assert export.headers["pragma"] == "no-cache"
+    assert export.headers["expires"] == "0"
+
+    payload = export.json()
+    assert payload["accountId"] == expected_account_id
+    assert payload["email"] == email
+    assert payload["planType"] == "plus"
+    assert payload["status"] == "active"
+
+    parsed_auth = parse_auth_json(payload["authJson"].encode("utf-8"))
+    assert parsed_auth.tokens.access_token == "access"
+    assert parsed_auth.tokens.refresh_token == "refresh"
+    assert parsed_auth.tokens.account_id == raw_account_id
+    assert parsed_auth.last_refresh_at is not None
+
+
+@pytest.mark.asyncio
+async def test_export_missing_account_returns_404(async_client):
+    response = await async_client.post("/api/accounts/missing/export")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_account_returns_404(async_client):
+    response = await async_client.delete("/api/accounts/missing")
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_set_alias_missing_account_returns_404(async_client):
+    response = await async_client.put("/api/accounts/missing/alias", json={"alias": "Personal Plus"})
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_set_and_clear_account_alias(async_client):
+    email = "alias@example.com"
+    raw_account_id = "acc_alias"
+    payload = {
+        "email": email,
+        "chatgpt_account_id": raw_account_id,
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+    }
+    auth_json = {
+        "tokens": {
+            "idToken": _encode_jwt(payload),
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "accountId": raw_account_id,
+        },
+    }
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    # Default summary uses the email since no alias is set yet.
+    listing = await async_client.get("/api/accounts")
+    matched = next(a for a in listing.json()["accounts"] if a["accountId"] == expected_account_id)
+    assert matched["alias"] is None
+    assert matched["displayName"] == email
+
+    # Setting an alias updates both `alias` and `displayName`.
+    set_response = await async_client.put(
+        f"/api/accounts/{expected_account_id}/alias",
+        json={"alias": "  Personal Plus  "},
+    )
+    assert set_response.status_code == 200
+    body = set_response.json()
+    assert body["alias"] == "Personal Plus"  # whitespace-trimmed
+    listing = await async_client.get("/api/accounts")
+    matched = next(a for a in listing.json()["accounts"] if a["accountId"] == expected_account_id)
+    assert matched["alias"] == "Personal Plus"
+    assert matched["displayName"] == "Personal Plus"
+
+    # Empty alias clears the value and the display name falls back to email.
+    clear_response = await async_client.put(
+        f"/api/accounts/{expected_account_id}/alias",
+        json={"alias": "   "},
+    )
+    assert clear_response.status_code == 200
+    assert clear_response.json()["alias"] is None
+    listing = await async_client.get("/api/accounts")
+    matched = next(a for a in listing.json()["accounts"] if a["accountId"] == expected_account_id)
+    assert matched["alias"] is None
+    assert matched["displayName"] == email
+
+
+@pytest.mark.asyncio
+async def test_list_accounts_flags_email_duplicates(async_client):
+    """Pin agent-lb #787 (B): after a token-invalidation cascade, the
+    re-add OAuth flow creates a second account row with the same email
+    but a fresh accountId for the same ChatGPT account identity and workspace
+    slot. /api/accounts surfaces that pair via isEmailDuplicate=true on both
+    rows so the dashboard can flag the operator's "stale + fresh" pair without
+    forcing them to group by email, ChatGPT identity, and workspace themselves.
+    """
+    from app.core.crypto import TokenEncryptor
+    from app.core.utils.time import utcnow
+    from app.db.models import Account, AccountStatus
+    from app.db.session import SessionLocal
+    from app.modules.accounts.repository import AccountsRepository
+
+    encryptor = TokenEncryptor()
+
+    def _account(account_id: str, email: str, chatgpt_id: str, workspace_id: str | None = None) -> Account:
+        return Account(
+            id=account_id,
+            chatgpt_account_id=chatgpt_id,
+            workspace_id=workspace_id,
+            email=email,
+            plan_type="plus",
+            access_token_encrypted=encryptor.encrypt("access"),
+            refresh_token_encrypted=encryptor.encrypt("refresh"),
+            id_token_encrypted=encryptor.encrypt("id"),
+            last_refresh=utcnow(),
+            status=AccountStatus.ACTIVE,
+            deactivation_reason=None,
+        )
+
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(_account("dup-stale", "dup@example.com", "chatgpt_same"), merge_by_email=False)
+        await repo.upsert(_account("dup-fresh", "dup@example.com", "chatgpt_same"), merge_by_email=False)
+        await repo.upsert(_account("workspace-a", "multi@example.com", "chatgpt_multi", "ws_a"), merge_by_email=False)
+        await repo.upsert(_account("workspace-b", "multi@example.com", "chatgpt_multi", "ws_b"), merge_by_email=False)
+        await repo.upsert(_account("workspace-other", "dup@example.com", "chatgpt_other"), merge_by_email=False)
+        await repo.upsert(_account("solo", "solo@example.com", "chatgpt_solo"), merge_by_email=False)
+        await repo.upsert(_account("placeholder-a", DEFAULT_EMAIL, "chatgpt_placeholder_a"), merge_by_email=False)
+        await repo.upsert(_account("placeholder-b", DEFAULT_EMAIL, "chatgpt_placeholder_b"), merge_by_email=False)
+        await repo.upsert(_account("blank-a", "   ", "chatgpt_blank"), merge_by_email=False)
+        await repo.upsert(_account("blank-b", "   ", "chatgpt_blank"), merge_by_email=False)
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts_by_id = {a["accountId"]: a for a in response.json()["accounts"]}
+
+    assert accounts_by_id["dup-stale"]["isEmailDuplicate"] is True
+    assert accounts_by_id["dup-fresh"]["isEmailDuplicate"] is True
+    assert accounts_by_id["workspace-a"]["isEmailDuplicate"] is False
+    assert accounts_by_id["workspace-b"]["isEmailDuplicate"] is False
+    assert accounts_by_id["workspace-other"]["isEmailDuplicate"] is False
+    assert accounts_by_id["solo"]["isEmailDuplicate"] is False
+    assert accounts_by_id["placeholder-a"]["isEmailDuplicate"] is False
+    assert accounts_by_id["placeholder-b"]["isEmailDuplicate"] is False
+    assert accounts_by_id["blank-a"]["isEmailDuplicate"] is False
+    assert accounts_by_id["blank-b"]["isEmailDuplicate"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_accounts_surfaces_owner_instance(async_client):
+    """GET /api/accounts exposes federation ownership: ownerInstance null +
+    isLocallyOwned true for the classic (non-federated) default, and the
+    owning instance's id + isLocallyOwned false for a mirrored account."""
+    from app.core.utils.time import utcnow
+    from app.modules.accounts.repository import AccountsRepository
+
+    encryptor = TokenEncryptor()
+
+    def _account(account_id: str, owner_instance: str | None) -> Account:
+        account = Account(
+            id=account_id,
+            chatgpt_account_id=f"chatgpt-{account_id}",
+            email=f"{account_id}@example.com",
+            plan_type="plus",
+            access_token_encrypted=encryptor.encrypt("access"),
+            refresh_token_encrypted=encryptor.encrypt("refresh"),
+            id_token_encrypted=encryptor.encrypt("id"),
+            last_refresh=utcnow(),
+            status=AccountStatus.ACTIVE,
+            deactivation_reason=None,
+        )
+        account.owner_instance = owner_instance
+        return account
+
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(_account("owner-null", None), merge_by_email=False)
+        # Not a real hostname, so it can never equal the test process's
+        # local_instance_id (which defaults to the machine hostname).
+        await repo.upsert(_account("owner-remote", "federation-other-instance"), merge_by_email=False)
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts_by_id = {a["accountId"]: a for a in response.json()["accounts"]}
+
+    assert accounts_by_id["owner-null"]["ownerInstance"] is None
+    assert accounts_by_id["owner-null"]["isLocallyOwned"] is True
+    assert accounts_by_id["owner-remote"]["ownerInstance"] == "federation-other-instance"
+    assert accounts_by_id["owner-remote"]["isLocallyOwned"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_accounts_fable_eligible_reflects_fresh_scoped_signal(async_client):
+    """GET /api/accounts renders fableEligible from Anthropic's dedicated
+    Fable-scoped weekly limit (fresh <=6h) in preference to the overall-weekly
+    heuristic, in both directions, and falls back to the heuristic once the
+    scoped row goes stale (see openspec/changes/fable-scoped-weekly-limit)."""
+    from datetime import timedelta
+
+    from app.core.utils.time import utcnow
+    from app.db.models import AdditionalUsageHistory, UsageHistory
+
+    encryptor = TokenEncryptor()
+
+    def _anthropic_account(
+        account_id: str,
+        email: str,
+        *,
+        status: AccountStatus = AccountStatus.ACTIVE,
+        subscription_status: str | None = None,
+    ) -> Account:
+        return Account(
+            id=account_id,
+            provider="anthropic",
+            chatgpt_account_id=account_id,
+            email=email,
+            plan_type="max",
+            access_token_encrypted=encryptor.encrypt(f"access-{account_id}"),
+            refresh_token_encrypted=encryptor.encrypt(f"refresh-{account_id}"),
+            id_token_encrypted=encryptor.encrypt(f"id-{account_id}"),
+            last_refresh=utcnow(),
+            status=status,
+            deactivation_reason=(
+                "Refresh token grant invalid - re-login required" if status == AccountStatus.REAUTH_REQUIRED else None
+            ),
+            subscription_status=subscription_status,
+        )
+
+    def _weekly_usage(account_id: str, used_percent: float) -> UsageHistory:
+        return UsageHistory(
+            account_id=account_id,
+            provider="anthropic",
+            window="secondary",
+            used_percent=used_percent,
+            window_minutes=10080,
+            recorded_at=utcnow(),
+        )
+
+    def _fable_scoped_weekly(account_id: str, used_percent: float, recorded_at) -> AdditionalUsageHistory:
+        return AdditionalUsageHistory(
+            account_id=account_id,
+            quota_key="anthropic_fable_scoped_weekly",
+            limit_name="anthropic_fable_scoped_weekly",
+            metered_feature="anthropic_fable_scoped_weekly",
+            window="primary",
+            used_percent=used_percent,
+            window_minutes=10080,
+            recorded_at=recorded_at,
+        )
+
+    now = utcnow()
+    async with SessionLocal() as session:
+        # Overall weekly headroom (30%, under the 50% heuristic) but a fresh
+        # scoped entry AT the scoped threshold (100%) — scoped must exclude.
+        session.add(_anthropic_account("acc-scoped-hot", "scoped-hot@example.com"))
+        session.add(_weekly_usage("acc-scoped-hot", 30.0))
+        session.add(_fable_scoped_weekly("acc-scoped-hot", 100.0, now))
+
+        # Overall weekly over the 50% heuristic (62%) but a fresh scoped
+        # entry with headroom (45%) — scoped must admit.
+        session.add(_anthropic_account("acc-scoped-cool", "scoped-cool@example.com"))
+        session.add(_weekly_usage("acc-scoped-cool", 62.0))
+        session.add(_fable_scoped_weekly("acc-scoped-cool", 45.0, now))
+
+        # Non-routable rows must not advertise Fable eligibility even when
+        # old/fresh usage data says the Fable-scoped budget has headroom.
+        session.add(
+            _anthropic_account(
+                "acc-scoped-reauth",
+                "scoped-reauth@example.com",
+                status=AccountStatus.REAUTH_REQUIRED,
+            )
+        )
+        session.add(_weekly_usage("acc-scoped-reauth", 10.0))
+        session.add(_fable_scoped_weekly("acc-scoped-reauth", 45.0, now))
+
+        session.add(
+            _anthropic_account(
+                "acc-scoped-canceled",
+                "scoped-canceled@example.com",
+                subscription_status="canceled",
+            )
+        )
+        session.add(_weekly_usage("acc-scoped-canceled", 10.0))
+        session.add(_fable_scoped_weekly("acc-scoped-canceled", 45.0, now))
+
+        # Overall weekly headroom (30%) with a scoped-exhausted (100%) row
+        # recorded over 6h ago — stale, so the heuristic (eligible) applies.
+        session.add(_anthropic_account("acc-scoped-stale", "scoped-stale@example.com"))
+        session.add(_weekly_usage("acc-scoped-stale", 30.0))
+        session.add(_fable_scoped_weekly("acc-scoped-stale", 100.0, now - timedelta(hours=7)))
+
+        await session.commit()
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts_by_id = {a["accountId"]: a for a in response.json()["accounts"]}
+
+    assert accounts_by_id["acc-scoped-hot"]["fableEligible"] is False
+    assert accounts_by_id["acc-scoped-cool"]["fableEligible"] is True
+    assert accounts_by_id["acc-scoped-reauth"]["fableEligible"] is False
+    assert accounts_by_id["acc-scoped-canceled"]["fableEligible"] is False
+    assert accounts_by_id["acc-scoped-stale"]["fableEligible"] is True

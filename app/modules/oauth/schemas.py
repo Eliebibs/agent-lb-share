@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from pydantic import Field
+
+from app.modules.oauth.subscription_usage import SubscriptionRoutingStatus
+from app.modules.shared.schemas import DashboardModel
+
+
+class OauthStartRequest(DashboardModel):
+    force_method: str | None = None
+    provider: str | None = None
+    subscription_only: bool = False
+
+
+class OauthStartResponse(DashboardModel):
+    flow_id: str | None = None
+    method: str
+    authorization_url: str | None = None
+    callback_url: str | None = None
+    verification_url: str | None = None
+    user_code: str | None = None
+    device_auth_id: str | None = None
+    interval_seconds: int | None = None
+    expires_in_seconds: int | None = None
+
+
+class OauthStatusResponse(DashboardModel):
+    status: str
+    error_message: str | None = None
+    account_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    email: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    routing_status: SubscriptionRoutingStatus | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class OauthCompleteRequest(DashboardModel):
+    flow_id: str | None = None
+    device_auth_id: str | None = None
+    user_code: str | None = None
+
+
+class OauthCancelRequest(DashboardModel):
+    flow_id: str
+
+
+class OauthCompleteResponse(DashboardModel):
+    status: str
+    account_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    email: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    routing_status: SubscriptionRoutingStatus | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ManualCallbackRequest(DashboardModel):
+    callback_url: str
+    flow_id: str | None = None
+
+
+class ManualCallbackResponse(DashboardModel):
+    status: str
+    error_message: str | None = None
+    account_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    email: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    routing_status: SubscriptionRoutingStatus | None = Field(default=None, exclude_if=lambda value: value is None)

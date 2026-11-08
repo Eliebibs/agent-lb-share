@@ -1,0 +1,52 @@
+# Tasks
+
+- [x] 1. Add provider schema migration and ORM fields.
+  - [x] Add `provider` to `accounts`, `request_logs`, and `usage_history`, defaulting existing rows to `openai`.
+  - [x] Make OpenAI-only account fields nullable where Anthropic has no equivalent.
+  - [x] Add Anthropic cache token columns to request logs.
+  - [x] Verify migration on fresh and existing SQLite databases.
+- [x] 2. Add provider dispatch seam.
+  - [x] Define provider identifiers and thin provider capability wrappers.
+  - [x] Route OpenAI refresh/account creation through the seam without changing OpenAI proxy behavior.
+  - [x] Add unit coverage for provider dispatch and OpenAI defaults.
+- [x] 3. Add Anthropic protocol core.
+  - [x] Add Messages request/response types and SSE parser coverage for message/content/tool/usage events.
+  - [x] Add cache-aware Anthropic pricing.
+  - [x] Add Anthropic model registry sync from mocked `GET /v1/models`.
+- [x] 4. Add Anthropic OAuth and refresh.
+  - [x] Implement PKCE authorize/token/refresh flow without `id_token`.
+  - [x] Persist Anthropic accounts with `provider='anthropic'`.
+  - [x] Add mocked token exchange and refresh coverage.
+- [x] 5. Add `/v1/messages` proxy.
+  - [x] Implement a slim Anthropic proxy service separate from `app/modules/proxy/service.py`.
+  - [x] Preserve inbound `anthropic-beta` and client system prompt content.
+  - [x] Inject `anthropic-version`, swap only Authorization, and stream Anthropic SSE through intact.
+  - [x] Verify provider-filtered account selection and cache-token request logging.
+- [x] 6. Update dashboard provider UI.
+  - [x] Add provider discriminator to account schemas.
+  - [x] Add provider selection to add-account/login flows.
+  - [x] Render provider badges and Anthropic cache-token cost columns.
+- [x] 7. Verify Stage A.
+  - [x] Run backend/frontend targeted tests, migration checks, and the existing OpenAI test suite.
+  - [x] Update `GOAL.md` Progress Log with each checkpoint result.
+  - [x] Record any remaining CP7 real-account runtime steps.
+- [x] 8. Harden Claude Code/Fable compatibility from live E2E findings.
+  - [x] Accept Claude Code `system` role messages inside Anthropic Messages payloads.
+  - [x] Preserve newer Claude Code fields such as adaptive thinking, context management, and output config.
+  - [x] Parse Anthropic OAuth account email addresses from `account.email_address`.
+- [x] 9. Add Claude Max top-model usage observability.
+  - [x] Reverse-engineer Claude Code `/usage` to the OAuth `GET /api/oauth/usage` endpoint.
+  - [x] Persist Anthropic `five_hour` and all-model `seven_day` utilization as standard quota windows.
+  - [x] Render Claude session/week usage bars and reset times in the account list and detail panel.
+  - [x] Parse Anthropic unified rate-limit reset headers as a fallback signal on upstream 429.
+  - [x] Keep Sonnet-only weekly utilization out of the main dashboard path.
+- [x] 10. Add Claude session stickiness and quota-scoped cooldown routing.
+  - [x] Preserve Claude Max billing/default model in the `cclb` launcher contract by using only `ANTHROPIC_BASE_URL`.
+  - [x] Derive hashed sticky keys from Claude session/conversation headers, with a stable first-turn fallback.
+  - [x] Pass Anthropic sticky keys through durable `codex_session` selection.
+  - [x] Classify Anthropic requests into standard, top-model, and top-model-thinking quota keys.
+  - [x] Record upstream Anthropic `429` reset evidence as additional quota cooldown rows instead of global account rate limits.
+  - [x] Filter Anthropic account selection by the requested quota-key cooldown while preserving OpenAI behavior.
+  - [x] Cover sticky routing, quota-key failover, account-status preservation, and dashboard payload exposure in focused proxy tests.
+  - [x] Restart local service and verify fresh default/Fable `cc` traffic live with Claude Max billing.
+  - 2026-06-14 verification refresh: `npx --yes @fission-ai/openspec@latest validate add-anthropic-provider --strict` -> valid; `uv run pytest -q tests/integration/test_anthropic_proxy.py tests/unit/test_claude_lb_launch.py` -> 25 passed; `uv run pytest -q tests/integration/test_proxy_sticky_sessions.py` -> 18 passed.

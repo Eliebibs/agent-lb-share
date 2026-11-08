@@ -1,0 +1,188 @@
+---
+name: "agent-lb-account-operator"
+description: |
+  Manage agent-lb account subscription/admin work with local browser profiles,
+  the dashboard subscription ledger, and gitignored operator memory.
+metadata:
+  author: agent-lb
+  version: "1.0.0"
+---
+
+# Agent LB Account Operator
+
+Use this skill when the user asks to add, cancel, pause, reactivate, verify, or
+open an OpenAI/ChatGPT/Anthropic account that agent-lb routes through. Also use
+it for account-specific support work such as quota reset checks,
+stuck/rate-limited account triage, subscription/account status checks, routing
+imbalance reports, or pause/reactivate routing requests.
+
+If the user is setting up a fresh machine or wiring clients, use `get-started`
+first. Use this skill for account-specific browser profiles, billing/admin
+actions, subscription-ledger updates, account status diagnostics, quota/rate
+limit triage, routing pause/reactivate work, routing imbalance diagnostics,
+account removal, or verification.
+
+## Local Registry
+
+Primary local file:
+
+```
+.agent-lb/account-profiles.json
+```
+
+This file is gitignored. It may contain account emails, Chrome profile paths,
+billing URLs, manual subscription notes, and human-only action history. Do not
+commit it. If it is missing, create it from:
+
+```
+.agents/skills/agent-lb-account-operator/account-profiles.example.json
+```
+
+Use the registry only as local operator memory. The agent-lb app database remains
+the dashboard source of truth for account status, routing pause/reactivate state,
+and subscription ledger fields.
+
+## Operating Model
+
+1. Read `.agent-lb/account-profiles.json` before account-management work.
+2. Match the account by `accountId`, email, alias, or provider.
+3. If a matching profile exists, open that browser profile rather than sharing a
+   generic Chrome session.
+4. If no profile exists, add an entry with `profileHandle`, `provider`,
+   `accountId` or email if known, and a dedicated `userDataDir`.
+5. If the user asks to add, open, verify, pause, or remove an account without
+   naming the provider, ask whether it is OpenAI/ChatGPT or Anthropic/Claude
+   before touching browser state or API rows.
+6. Record manual billing actions in `subscriptionHistory` with exact dates.
+7. Update agent-lb's subscription ledger after each human/browser billing action.
+8. For quota reset, stuck account, rate-limited account, subscription status, or
+   routing imbalance reports, inspect the matching dashboard/API account row and
+   local profile notes before recommending billing, routing, or browser actions.
+
+## Auth Verification (real upstream probes)
+
+To verify that an account's auth actually works — not just that tokens are
+stored — use the dashboard API's per-account probe endpoints on the local
+service (`http://127.0.0.1:2455`, or the tailnet serve URL). Both send a real
+minimal `/v1/messages` request pinned to that one account, refreshing tokens
+first and bypassing load-balancer scoring:
+
+- `POST /api/accounts/{accountId}/probe` — returns `probeStatusCode` plus
+  before/after usage percents and account status. Also wakes the upstream
+  rate limiter for stuck accounts and forces a usage refresh.
+- `POST /api/accounts/{accountId}/subscription/check` — same probe, but also
+  returns the upstream error `message` and updates the subscription ledger
+  (`working`, `subscription.status`, `subscription.notes`). Run this second,
+  when a probe fails, to see why.
+
+Interpretation and gotchas:
+
+- Responses are camelCase (`probeStatusCode`, `accountStatusAfter`), not
+  snake_case.
+- `200` = auth and subscription both usable.
+- `403` with "OAuth authentication is currently not allowed for this
+  organization" = tokens are fine but the org has no active Claude
+  subscription (canceled/lapsed). Billing problem, not an auth problem —
+  reauth will not fix it; resubscribe or remove instead.
+- `401` = auth actually broken; reauth via the account's dedicated browser
+  profile.
+- Accounts in `paused` / `reauth_required` / `deactivated` state are refused
+  with HTTP 409 `account_not_probable`; reactivate first if a probe is needed.
+- Anthropic probes default to `claude-haiku-4-5` with `max_tokens: 4`
+  (negligible quota). Override with `{"model": "..."}` in the request body.
+
+Verify-all loop (swap the provider filter as needed):
+
+```bash
+LB=http://127.0.0.1:2455
+curl -s "$LB/api/accounts" |
+  jq -r '.accounts[] | select(.provider=="anthropic") | "\(.accountId)|\(.email)|\(.status)"' |
+  while IFS='|' read -r id email st; do
+    [ "$st" = active ] || { echo "$email: skipped ($st)"; continue; }
+    curl -s -X POST "$LB/api/accounts/$id/probe" -H 'content-type: application/json' -d '{}' |
+      jq -c --arg e "$email" '{email: $e, probeStatusCode, accountStatusAfter}'
+  done
+```
+
+## Account State Model (and which fix to recommend)
+
+Every stored account is in exactly one of three states. Diagnose with a probe;
+never infer the fix from `status` alone:
+
+- **Usable** — `status=active`, subscription ledger not `canceled`, probe 2xx.
+- **Auth'd but unsubscribed** — `status=active` + `subscription.status=canceled`,
+  probe 403 with the org-OAuth-refused message. Credentials are fine; the org's
+  subscription lapsed. Fix = the human resubscribes at the provider billing page
+  (open their dedicated browser profile). Reauth does nothing here.
+- **Disconnected** — `status=reauth_required`/`deactivated` with a deactivation
+  reason, probe 401 or token refresh fails. Fix = reauth via the repo's auth
+  scripts (`scripts/anthropic-auth.sh start` / `scripts/openai-auth.sh start`,
+  same flow as adding an account — no dashboard needed).
+
+A background **account pulse** (default on, 6h interval, `ACCOUNT_PULSE_*` env
+settings) probes every non-paused account and reconciles these states
+automatically — including restoring accounts to the routing pool within one
+cycle after the human resubscribes or reauths, and correcting stale
+misdiagnoses (e.g. a deactivated "auth failed" account that is actually just
+unsubscribed). Pulse transitions appear as `account_pulse_*` audit actions.
+After a human billing/reauth action, you can shortcut the wait with
+`POST /api/accounts/{id}/subscription/check` (canceled ledgers only) or a
+probe. Unsubscribed and disconnected accounts stay visible in `/api/accounts`
+but are excluded from routing, warmup, and headline counts.
+
+When someone asks why a projections surface says elevated risk:
+`GET /api/dashboard/projections` risk is pool-level (mean across accounts);
+`worstAccountEmail`/`worstRiskLevel` name the account driving it and
+`depletionPrimaryByProvider`/`depletionSecondaryByProvider` scope it per
+provider. A single hot account (e.g. one long interactive session pinned by
+sticky routing) elevates its own attribution, not the pool.
+
+## Browser Profiles
+
+Prefer dedicated Chrome user-data directories under:
+
+```
+.agent-lb/chrome-profiles/<profileHandle>
+```
+
+Open a profile on macOS with:
+
+```bash
+open -na "Google Chrome" --args --user-data-dir="$PWD/.agent-lb/chrome-profiles/<profileHandle>" "https://chatgpt.com"
+```
+
+Use the Chrome plugin only after the requested profile/browser is open and the
+user asks for browser control. Keep one provider account per profile so cookies,
+billing pages, and login state do not bleed across accounts.
+
+## Subscription Ledger Mapping
+
+Use these statuses in the agent-lb dashboard/API ledger:
+
+- `active`: subscription is expected to renew on `nextChargeAt`.
+- `pause_pending`: operator intends to pause/cancel before `nextChargeAt`, but
+  vendor action is not yet complete.
+- `paused`: vendor subscription or local routing should be treated as paused;
+  check notes for which one.
+- `canceled`: vendor access period ended or subscription is fully canceled.
+
+For screenshots like "will remain active until ... Jun 22, 2026", keep the
+subscription active and record the date separately:
+
+```json
+{
+  "status": "active",
+  "currentPeriodEndAt": "2026-06-22T04:00:00.000Z",
+  "nextChargeAt": null
+}
+```
+
+## Safety
+
+- Do not store passwords, recovery codes, access tokens, refresh tokens, card
+  numbers, or secrets in the registry.
+- Do not submit purchase, cancellation, reactivation, payment-method, or plan
+  upgrade actions without explicit user confirmation in the current turn.
+- Distinguish vendor subscription state from agent-lb routing state. Pausing an
+  account in agent-lb only removes it from routing; it does not cancel vendor
+  billing.

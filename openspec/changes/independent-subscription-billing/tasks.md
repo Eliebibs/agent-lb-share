@@ -1,0 +1,4 @@
+- [x] Persist independent billing evidence and exclude it from quota aggregates.
+- [x] Share fresh billing policy across subscription routing and login readiness.
+- [x] Exercise null-primary, missing/enabled/stale billing and unchanged quota behavior.
+- [x] Deploy after explicit authorization for a brief LB reconnect; verify live subscription inference.

@@ -1,0 +1,268 @@
+import Foundation
+
+// MARK: - Accounts
+
+private let fableScopedWeeklyQuotaKey = "anthropic_fable_scoped_weekly"
+
+struct AccountsResponse: Decodable {
+  let accounts: [Account]
+}
+
+struct Account: Decodable, Identifiable, Sendable, Equatable {
+  let accountId: String
+  let provider: String
+  let email: String?
+  let alias: String?
+  let displayName: String
+  let workspaceLabel: String?
+  let planType: String?
+  let routingPolicy: String?
+  let status: String
+  let fableEligible: Bool?
+  let resetCreditsAvailable: Int?
+  let additionalQuotas: [AccountAdditionalQuota]?
+  let usage: AccountUsage
+  // §9.2: per-account credit sums drive the scoped pool windows.
+  let remainingCreditsPrimary: Double?
+  let capacityCreditsPrimary: Double?
+  let remainingCreditsSecondary: Double?
+  let capacityCreditsSecondary: Double?
+  let resetAtPrimary: Date?
+  let resetAtSecondary: Date?
+  let resetAtMonthly: Date?
+  let rateLimitResetAt: Date?
+  let lastRefreshAt: Date?
+  let deactivationReason: String?
+  let isEmailDuplicate: Bool?
+  let subscription: AccountSubscriptionLedger?
+
+  var id: String { accountId }
+}
+
+extension Account {
+  var fableAvailability: FableAvailability? {
+    guard provider.lowercased() == "anthropic", let fableEligible else { return nil }
+    return fableEligible ? .available : .out
+  }
+
+  var fableRemainingPercent: Double? {
+    guard provider.lowercased() == "anthropic" else { return nil }
+    guard let usedPercent = additionalQuotas?
+      .first(where: { $0.quotaKey == fableScopedWeeklyQuotaKey })?
+      .primaryWindow?
+      .usedPercent
+    else {
+      return nil
+    }
+    return min(100, max(0, 100 - usedPercent))
+  }
+
+  var fableAvailabilityLabel: String? {
+    guard let availability = fableAvailability else { return nil }
+    guard let remaining = fableRemainingPercent else { return availability.label }
+    switch availability {
+    case .available:
+      return "FABLE \(Format.percent(remaining))"
+    case .out:
+      return "FABLE OUT \(Format.percent(remaining))"
+    }
+  }
+
+  var fableAvailabilityHelp: String? {
+    guard let availability = fableAvailability else { return nil }
+    guard let remaining = fableRemainingPercent else { return availability.help }
+    switch availability {
+    case .available:
+      return "Fable usage available (\(Format.percent(remaining)) remaining)"
+    case .out:
+      return "Out of Fable usage (\(Format.percent(remaining)) remaining)"
+    }
+  }
+
+  var isSubscriptionCanceled: Bool {
+    subscription?.status == "canceled"
+  }
+
+  var isDisconnected: Bool {
+    status == "deactivated" || status == "reauth_required" || deactivationReason != nil
+  }
+
+  var isHeadlineCountable: Bool {
+    !isSubscriptionCanceled && !isDisconnected
+  }
+
+  var isRoutable: Bool {
+    isHeadlineCountable && status != "paused"
+  }
+}
+
+enum FableAvailability: Sendable, Equatable {
+  case available
+  case out
+
+  var label: String {
+    switch self {
+    case .available: return "FABLE"
+    case .out: return "FABLE OUT"
+    }
+  }
+
+  var help: String {
+    switch self {
+    case .available: return "Fable usage available"
+    case .out: return "Out of Fable usage"
+    }
+  }
+}
+
+struct AccountSubscriptionLedger: Decodable, Sendable, Equatable {
+  let status: String?
+  // §11: operator-entered monthly subscription price. Nil unless a human has
+  // recorded it on the account; the arbitrage view falls back to PlanPricing's
+  // list-price table (and marks the figure estimated) when it is absent.
+  let amount: Double?
+  let currency: String?
+  let nextChargeAt: Date?
+  let currentPeriodEndAt: Date?
+  let lastVerifiedAt: Date?
+}
+
+struct AccountUsage: Decodable, Sendable, Equatable {
+  let primaryRemainingPercent: Double?
+  let secondaryRemainingPercent: Double?
+  let monthlyRemainingPercent: Double?
+}
+
+struct AccountAdditionalQuota: Decodable, Sendable, Equatable {
+  let quotaKey: String?
+  let primaryWindow: AccountAdditionalWindow?
+}
+
+struct AccountAdditionalWindow: Decodable, Sendable, Equatable {
+  let usedPercent: Double
+  let resetAt: Int?
+  let windowMinutes: Int?
+}
+
+// MARK: - Account Refresh
+
+/// Endpoint choice for the per-row refresh control. Unsubscribed rows must
+/// re-verify the subscription ledger (a probe never updates it); routable
+/// rows probe, which wakes the upstream rate limiter and refreshes usage.
+/// Paused/disconnected rows get no action — the server rejects their probes
+/// with 409 `account_not_probable`, and reactivation is the real fix.
+enum AccountRefreshAction: Sendable, Equatable {
+  case checkSubscription
+  case probe
+
+  static func action(for account: Account) -> AccountRefreshAction? {
+    if account.isSubscriptionCanceled { return .checkSubscription }
+    if account.status == "paused" || account.isDisconnected { return nil }
+    return .probe
+  }
+}
+
+struct AccountProbeResponse: Decodable, Sendable, Equatable {
+  let status: String
+  let accountId: String
+  let probeStatusCode: Int
+}
+
+struct AccountSubscriptionCheckResponse: Decodable, Sendable, Equatable {
+  let status: String
+  let accountId: String
+  let working: Bool
+  let probeStatusCode: Int
+  let subscription: AccountSubscriptionLedger?
+}
+
+// MARK: - Usage Summary
+
+struct UsageSummary: Decodable, Sendable, Equatable {
+  let primaryWindow: UsageWindow?
+  let secondaryWindow: UsageWindow?
+  let monthlyWindow: UsageWindow?
+  let cost: CostSummary?
+  let metrics: SummaryMetrics?
+}
+
+struct UsageWindow: Decodable, Sendable, Equatable {
+  let remainingPercent: Double?
+  let capacityCredits: Double?
+  let remainingCredits: Double?
+  let resetAt: Date?
+  let windowMinutes: Int?
+}
+
+struct CostSummary: Decodable, Sendable, Equatable {
+  let currency: String?
+  let totalUsd7d: Double?
+}
+
+struct SummaryMetrics: Decodable, Sendable, Equatable {
+  let requests7d: Int?
+  let errorRate7d: Double?
+  let topError: String?
+  let tokensSecondaryWindow: Int?
+  let cachedTokensSecondaryWindow: Int?
+}
+
+// MARK: - Projections
+
+struct ProjectionsResponse: Decodable, Sendable, Equatable {
+  let depletionPrimary: Depletion?
+  let depletionSecondary: Depletion?
+  let weeklyCreditPace: WeeklyCreditPace?
+}
+
+struct Depletion: Decodable, Sendable, Equatable {
+  let risk: Double?
+  let riskLevel: String?
+  let projectedExhaustionAt: Date?
+  let secondsUntilExhaustion: Double?
+}
+
+struct WeeklyCreditPace: Decodable, Sendable, Equatable {
+  let actualUsedPercent: Double?
+  let scheduledUsedPercent: Double?
+  let deltaPercent: Double?
+  let status: String?
+  let confidence: String?
+}
+
+// MARK: - Request Logs
+
+struct RequestLogsResponse: Decodable, Sendable, Equatable {
+  let requests: [RequestLogEntry]
+  let total: Int
+  let hasMore: Bool
+}
+
+struct RequestLogEntry: Decodable, Identifiable, Sendable, Equatable {
+  let requestedAt: Date
+  let requestId: String
+  let accountId: String?
+  let model: String?
+  let status: String
+  let errorCode: String?
+  let tokens: Int?
+  let costUsd: Double?
+  let latencyMs: Double?
+
+  var id: String { requestId }
+}
+
+// MARK: - Runtime Version
+
+struct RuntimeVersion: Decodable, Sendable, Equatable {
+  let currentVersion: String?
+  let latestVersion: String?
+  let updateAvailable: Bool
+  let releaseUrl: String?
+}
+
+// MARK: - Health
+
+struct HealthResponse: Decodable, Sendable {
+  let status: String
+}
